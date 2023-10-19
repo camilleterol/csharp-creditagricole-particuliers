@@ -1,6 +1,7 @@
 ﻿using System.Text.Json;
 using System.Text.RegularExpressions;
 using CreditAgricoleSdk.Entity;
+using CreditAgricoleSdk.Extensions;
 using CreditAgricoleSdk.Interfaces;
 using CreditAgricoleSdk.Repository.Interfaces;
 using CreditAgricoleSdk.Serializer.Interfaces;
@@ -12,20 +13,25 @@ public class Client
     private readonly IRegionalBankRepository _regionalBankRepository;
     private readonly IKeypadRepository _keypadRepository;
     private readonly IHttpClient _client;
+    private readonly IAccountSerializer _accountSerializer;
     private readonly IOperationSerializer _operationSerializer;
+    private readonly IOperationsInfoSerializer _operationsInfoSerializer;
 
     private RegionalBank? _bank;
-    private bool disposed;
 
     public Client(IRegionalBankRepository regionalBankRepository,
         IKeypadRepository keypadRepository,
         IHttpClient client,
-        IOperationSerializer operationSerializer)
+        IAccountSerializer accountSerializer,
+        IOperationSerializer operationSerializer,
+        IOperationsInfoSerializer operationsInfoSerializer)
     {
         _regionalBankRepository = regionalBankRepository;
         _keypadRepository = keypadRepository;
         _client = client;
+        _accountSerializer = accountSerializer;
         _operationSerializer = operationSerializer;
+        _operationsInfoSerializer = operationsInfoSerializer;
     }
     
     public async Task Login(int departmentNumber, string username, string password)
@@ -52,27 +58,27 @@ public class Client
         StreamReader reader = await _client.GetAsyncStreamReader($"{_bank.UrlPrefix}particulier/operations/synthese.html");
         var overview = new Overview();
         
-        while (await reader.ReadLineAsync() is { } line) 
-            ParseSynthese(line, overview);
-
-        return overview;
-
-        void ParseSynthese(string line, Overview overview)
+        while (await reader.ReadLineAsync() is { } line)
         {
             Match syntheseData = Regex.Match(line,
                 @"data-ng-init=[""']syntheseController\.init\((.+), {(?!})[a-zA-Z0-9 _:"",-]+}\)[""']");
             
             if (syntheseData.Groups.Count != 2) 
-                return;
+                continue;
             
-            var jsonData = JsonSerializer.Deserialize<JsonElement>(syntheseData.Groups[1].ToString());
+            ParseSynthese(JsonSerializer.Deserialize<JsonElement>(syntheseData.Groups[1].ToString()), overview);
+        }
 
-            ParseLastConnection(jsonData.GetProperty("informationsClient"), overview);
+        return overview;
 
-            JsonElement comptePrincipal = jsonData.GetProperty("comptePrincipal"); 
+        void ParseSynthese(JsonElement data, Overview overview)
+        {
+            ParseLastConnection(data.GetProperty("informationsClient"), overview);
+
+            JsonElement comptePrincipal = data.GetProperty("comptePrincipal"); 
             
             overview.MainAccount = ParseAccount(comptePrincipal);
-            ParseSecondaryAccounts(jsonData.GetProperty("grandesFamilles").EnumerateArray(), overview);
+            ParseSecondaryAccounts(data.GetProperty("grandesFamilles").EnumerateArray(), overview);
 
             ParseLastOperations(comptePrincipal.GetProperty("operations").EnumerateArray(), overview);
         }
@@ -81,12 +87,11 @@ public class Client
         {
             foreach (JsonElement productFamily in productFamilies)
             {
-                var accounts = productFamily.GetProperty("elementsContrats").EnumerateArray();
+                JsonElement.ArrayEnumerator accounts = productFamily.GetProperty("elementsContrats").EnumerateArray();
 
-                foreach (JsonElement account in accounts)
+                foreach (JsonElement account in accounts.Where(account => int.Parse(account.GetProperty("grandeFamilleProduitCode").GetString()) == 3))
                 {
-                    if (int.Parse(account.GetProperty("grandeFamilleProduitCode").GetString()) == 3)
-                        overview.SavingsAccounts.Add(ParseAccount(account));
+                    overview.SavingsAccounts.Add(ParseAccount(account));
                 }
             }
         }
@@ -113,24 +118,7 @@ public class Client
                 int.Parse(lastConnection.Groups[6].ToString()));
         }
 
-        Account ParseAccount(JsonElement account)
-        {
-            return new Account
-            {
-                Id = account.GetProperty("index").GetInt32(),
-                ContractId = account.GetProperty("idElementContrat").GetString(),
-                FamilyCode = int.Parse(account.GetProperty("grandeFamilleProduitCode").GetString()),
-                Number = long.Parse(account.GetProperty("numeroCompte").GetString()),
-                Balance = account.GetProperty("solde").GetDecimal(),
-            };
-        }
-    }
-
-    public async Task<Summary> GetSummary()
-    {
-        await GetOverview();
-        
-        return await Task.FromResult(new Summary());
+        Account ParseAccount(JsonElement account) => _accountSerializer.Deserialize(account);
     }
 
     public async Task<IEnumerable<Operation>> GetOperations(Account account)
@@ -161,5 +149,58 @@ public class Client
         accounts.AddRange(overview.SavingsAccounts);
 
         return accounts;
+    }
+
+    public async Task<OperationsInfo> GetOperationsInfo(Account account, string index)
+    {
+        var json = await _client.GetAsync<JsonElement>(
+            $"{_bank.UrlPrefix}particulier/operations/synthese/detail-comptes/jcr:content.n3.operations.json", new[]
+            {
+                new KeyValuePair<string, string>("compteIdx", account.Id.ToString()),
+                new KeyValuePair<string, string>("grandeFamilleCode", account.FamilyCode.ToString()),
+                new KeyValuePair<string, string>("idDevise", "EUR"),
+                new KeyValuePair<string, string>("startIndex", index),
+            });
+
+        return _operationsInfoSerializer.Deserialize(json);
+    }
+
+    public async Task<IEnumerable<Operation>> GetCurrentMonthOperations(Account account)
+    {
+        DateTime today = DateTime.Now.Date;
+        var firstOfMonth = new DateTime(today.Year, today.Month, 1);
+        
+        var json = await _client.GetAsync<JsonElement>(
+            $"{_bank.UrlPrefix}particulier/operations/synthese/detail-comptes/jcr:content.n3.operations.json", new[]
+            {
+                new KeyValuePair<string, string>("compteIdx", account.Id.ToString()),
+                new KeyValuePair<string, string>("grandeFamilleCode", account.FamilyCode.ToString()),
+                new KeyValuePair<string, string>("idDevise", "EUR"),
+                new KeyValuePair<string, string>("dateDebut", firstOfMonth.ToUnixTimestamp()),
+                new KeyValuePair<string, string>("dateFin", today.ToUnixTimestamp()),
+            });
+
+        var operations = new List<Operation>();
+        
+        OperationsInfo operationsInfo = _operationsInfoSerializer.Deserialize(json);
+        bool hasNext = operationsInfo.HasNext;
+        string index = operationsInfo.NextSetStartIndex;
+        
+        operations.AddRange(operationsInfo.Operations);
+        
+        while (hasNext)
+        {
+            OperationsInfo infos = await GetOperationsInfo(account, index);
+            hasNext = infos.HasNext;
+            index = infos.NextSetStartIndex;
+
+            List<Operation> currentMonthOperations = infos.Operations.Where(o => o.Date >= firstOfMonth).ToList();
+            operations.AddRange(currentMonthOperations);
+
+            if (infos.Operations.Count() > currentMonthOperations.Count)
+                break;
+        }
+            
+        return operations;
     }
 }

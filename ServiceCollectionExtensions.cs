@@ -15,7 +15,9 @@ public static class ServiceCollectionExtensions
             .AddScoped<IHttpClient, HttpClient>()
             .AddScoped<IKeypadRepository, KeypadRepository>()
             .AddScoped<IRegionalBankRepository, RegionalBankRepository>()
+            .AddScoped<IAccountSerializer, AccountSerializer>()
             .AddScoped<IOperationSerializer, OperationSerializer>()
+            .AddScoped<IOperationsInfoSerializer, OperationsInfoSerializer>()
         ;
 
         return services;
